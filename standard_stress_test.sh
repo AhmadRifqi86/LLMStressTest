@@ -233,13 +233,26 @@ if [ "$CONTINUE_MODE" -eq 1 ]; then
     if [ "${#SELECT_ARGS[@]}" -eq 0 ]; then
         # When no models are provided, resume the exact set that was attempted in the last run.
         mapfile -t RESUME_CFGS < <(
-            grep -oP '^\[[0-9]+/[0-9]+\]\s+\K[^ ]+' "$RESUME_REPORT" | awk '!seen[$0]++'
+            awk '/^\[[0-9]+\/[0-9]+\][[:space:]]+/ {print $2}' "$RESUME_REPORT" | awk '!seen[$0]++'
         )
 
+        # Fallback for reports that only have per-model summary blocks.
         if [ "${#RESUME_CFGS[@]}" -eq 0 ]; then
-            echo "ERROR: Could not extract model list from ${RESUME_REPORT}."
-            echo "Provide model names explicitly with continue, e.g. ./standard_stress_test.sh continue llama3.2-1b"
-            exit 1
+            mapfile -t RESUME_CFGS < <(
+                awk '/RESULTS SUMMARY/ {
+                    for (i=1; i<=NF; i++) {
+                        if ($i=="SUMMARY" && (i+2)<=NF) { print $(i+2); break }
+                    }
+                }' "$RESUME_REPORT" | awk '!seen[$0]++'
+            )
+        fi
+
+        if [ "${#RESUME_CFGS[@]}" -eq 0 ]; then
+            log "Continue mode: could not extract attempted model list from ${RESUME_REPORT}; defaulting to all known models."
+            RESUME_CFGS=()
+            for entry in "${ALL_MODELS[@]}"; do
+                RESUME_CFGS+=("$(echo "$entry" | cut -d'|' -f3)")
+            done
         fi
 
         MODELS=()
@@ -251,10 +264,20 @@ if [ "$CONTINUE_MODE" -eq 1 ]; then
                 fi
             done
         done
+
+        if [ "${#MODELS[@]}" -eq 0 ]; then
+            echo "ERROR: Continue mode could not map any model names from ${RESUME_REPORT}."
+            echo "Provide explicit models, e.g. ./standard_stress_test.sh continue llama3.2-1b"
+            exit 1
+        fi
     fi
 
     mapfile -t DONE_CFGS < <(
-        grep -oP 'RESULTS SUMMARY —\s*\K[^ ]+' "$RESUME_REPORT" | awk '!seen[$0]++'
+        awk '/RESULTS SUMMARY/ {
+            for (i=1; i<=NF; i++) {
+                if ($i=="SUMMARY" && (i+2)<=NF) { print $(i+2); break }
+            }
+        }' "$RESUME_REPORT" | awk '!seen[$0]++'
     )
 
     if [ "${#DONE_CFGS[@]}" -gt 0 ]; then
