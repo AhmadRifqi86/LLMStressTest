@@ -282,69 +282,85 @@ lfix = {'1':'A','2':'B','3':'C','4':'D','A':'A','B':'B','C':'C','D':'D'}
 print("# ARC-Easy — allenai/ai2_arc ARC-Easy test split")
 ds = [x for x in load_dataset("allenai/ai2_arc","ARC-Easy",split="test",trust_remote_code=True)
       if len(x['choices']['label']) == 4]
-items = random.sample(ds, min(N, len(ds)))
+if len(ds) < N:
+    raise RuntimeError(f"ARC-Easy: only {len(ds)} 4-choice questions in test split (need {N})")
+items = random.sample(ds, N)
 qs, ans = [], []
 for x in items:
     labs = [lfix.get(l, l) for l in x['choices']['label']]
     opts = '\n'.join(f'({l}) {t}' for l, t in zip(labs, x['choices']['text']))
     qs.append(x['question'] + '\n' + opts)
     ans.append(lfix.get(x['answerKey'], x['answerKey']))
+assert len(qs) == N, f"ARC-Easy: got {len(qs)} questions, expected {N}"
 emit_arr("ARC_E_Q", qs); emit_ans("ARC_E_ANS", ans)
 
 # ── ARC-Challenge ────────────────────────────────────────────────────
 print("\n# ARC-Challenge — allenai/ai2_arc ARC-Challenge test split")
 ds = [x for x in load_dataset("allenai/ai2_arc","ARC-Challenge",split="test",trust_remote_code=True)
       if len(x['choices']['label']) == 4]
-items = random.sample(ds, min(N, len(ds)))
+if len(ds) < N:
+    raise RuntimeError(f"ARC-Challenge: only {len(ds)} 4-choice questions in test split (need {N})")
+items = random.sample(ds, N)
 qs, ans = [], []
 for x in items:
     labs = [lfix.get(l, l) for l in x['choices']['label']]
     opts = '\n'.join(f'({l}) {t}' for l, t in zip(labs, x['choices']['text']))
     qs.append(x['question'] + '\n' + opts)
     ans.append(lfix.get(x['answerKey'], x['answerKey']))
+assert len(qs) == N, f"ARC-Challenge: got {len(qs)} questions, expected {N}"
 emit_arr("ARC_C_Q", qs); emit_ans("ARC_C_ANS", ans)
 
 # ── HellaSwag ────────────────────────────────────────────────────────
 print("\n# HellaSwag — Rowan/hellaswag validation split")
 ds = list(load_dataset("Rowan/hellaswag", split="validation", trust_remote_code=True))
+if len(ds) < N:
+    raise RuntimeError(f"HellaSwag: only {len(ds)} examples in validation split (need {N})")
 items = random.sample(ds, N)
 qs, ans = [], []
 for x in items:
     opts = '\n'.join(f'({chr(65+i)}) {e.strip()}' for i, e in enumerate(x['endings']))
     qs.append(x['ctx'].strip() + '\n' + opts)
     ans.append(chr(65 + int(x['label'])))
+assert len(qs) == N, f"HellaSwag: got {len(qs)} questions, expected {N}"
 emit_arr("HS_Q", qs); emit_ans("HS_ANS", ans)
 
 # ── MMLU ────────────────────────────────────────────────────────────
 print("\n# MMLU — cais/mmlu all subjects test split")
 ds = list(load_dataset("cais/mmlu", "all", split="test", trust_remote_code=True))
-items = random.sample(ds, min(N, len(ds)))
+if len(ds) < N:
+    raise RuntimeError(f"MMLU: only {len(ds)} questions in test split (need {N})")
+items = random.sample(ds, N)
 qs, ans = [], []
 for x in items:
     opts = '\n'.join(f'({chr(65+i)}) {c}' for i, c in enumerate(x['choices']))
     qs.append(x['question'] + '\n' + opts)
     ans.append(chr(65 + x['answer']))
+assert len(qs) == N, f"MMLU: got {len(qs)} questions, expected {N}"
 emit_arr("MMLU_Q", qs); emit_ans("MMLU_ANS", ans)
 
 # ── GSM8K ────────────────────────────────────────────────────────────
 print("\n# GSM8K — openai/gsm8k main test split")
 ds = list(load_dataset("openai/gsm8k", "main", split="test", trust_remote_code=True))
-items = random.sample(ds, min(N, len(ds)))
+if len(ds) < N:
+    raise RuntimeError(f"GSM8K: only {len(ds)} questions in test split (need {N})")
+items = random.sample(ds, N)
 qs, ans = [], []
 for x in items:
     m = re.search(r'####\s*([\d,]+)', x['answer'])
     qs.append(x['question'])
     ans.append(m.group(1).replace(',', '') if m else '?')
+assert len(qs) == N, f"GSM8K: got {len(qs)} questions, expected {N}"
 emit_arr("GSM8K_Q", qs); emit_ans("GSM8K_ANS", ans)
 
 # ── TruthfulQA ───────────────────────────────────────────────────────
+# Filter: need exactly 1 correct answer + at least 3 wrong answers to form 4-choice MC.
+# TruthfulQA validation has 817 questions; virtually all pass the filter (>800 qualify),
+# so 100 is always reachable. Raise immediately if the pool is insufficient.
 print("\n# TruthfulQA — truthful_qa multiple_choice validation split")
 ds = list(load_dataset("truthful_qa", "multiple_choice", split="validation", trust_remote_code=True))
 random.shuffle(ds)
-qs, ans = [], []
+pool = []
 for x in ds:
-    if len(qs) >= N:
-        break
     choices = x['mc1_targets']['choices']
     labels  = x['mc1_targets']['labels']   # 1=correct, 0=wrong
     if 1 not in labels:
@@ -353,11 +369,18 @@ for x in ds:
     wrong = [c for c, l in zip(choices, labels) if l == 0]
     if len(wrong) < 3:
         continue
+    pool.append((x['question'], correct_text, wrong))
+if len(pool) < N:
+    raise RuntimeError(f"TruthfulQA: only {len(pool)} questions pass 4-choice filter (need {N})")
+pool = pool[:N]
+qs, ans = [], []
+for question, correct_text, wrong in pool:
     four = [correct_text] + random.sample(wrong, 3)
     random.shuffle(four)
     opts = '\n'.join(f'({chr(65+i)}) {c}' for i, c in enumerate(four))
-    qs.append(x['question'] + '\n' + opts)
+    qs.append(question + '\n' + opts)
     ans.append(chr(65 + four.index(correct_text)))
+assert len(qs) == N, f"TruthfulQA: got {len(qs)} questions, expected {N}"
 emit_arr("TQA_Q", qs); emit_ans("TQA_ANS", ans)
 PYEOF
 
@@ -372,6 +395,18 @@ fi
 # shellcheck disable=SC1090
 source "$_Q_CACHE"
 echo "Loaded questions: ARC-E=${#ARC_E_Q[@]} ARC-C=${#ARC_C_Q[@]} HellaSwag=${#HS_Q[@]} MMLU=${#MMLU_Q[@]} GSM8K=${#GSM8K_Q[@]} TruthfulQA=${#TQA_Q[@]}"
+
+# ── Hard check: every benchmark must have exactly 100 questions ───────
+_q_ok=1
+for _bench_arr in ARC_E_Q ARC_C_Q HS_Q MMLU_Q GSM8K_Q TQA_Q; do
+    eval "_cnt=\${#${_bench_arr}[@]}"
+    if [ "$_cnt" -ne 100 ]; then
+        echo "ERROR: ${_bench_arr} has ${_cnt} questions (expected 100)."
+        echo "       Delete ${_Q_CACHE} and re-run to regenerate the cache."
+        _q_ok=0
+    fi
+done
+[ "$_q_ok" -eq 0 ] && exit 1
 
 # ── Section 7: Long Context / Needle-in-a-Haystack ────────────────────
 # Kamradt (2023) methodology: hide a unique fact inside domain text;
