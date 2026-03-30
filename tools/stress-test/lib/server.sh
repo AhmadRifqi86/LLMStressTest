@@ -63,6 +63,7 @@ start_server() {
 
     ssh "$SSH_TARGET" "bash -c '
         cd ${REMOTE_DIR} || exit 1
+        chmod +x llama-server llama-cli 2>/dev/null || true
         nohup ./llama-server \
             -m model/${MODEL_FILE} \
             --host 0.0.0.0 \
