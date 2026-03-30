@@ -64,13 +64,15 @@ source "${SCRIPT_DIR}/lib/report.sh"
 
 # ── Parse arguments ───────────────────────────────────────────────────
 Q_COUNT=100
+CONTINUE_MODE=0
 SELECT_ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
-        --count)      Q_COUNT="$2"; shift 2 ;;
-        --count=*)    Q_COUNT="${1#*=}"; shift ;;
-        -*)           echo "Unknown flag: $1"; exit 1 ;;
-        *)            SELECT_ARGS+=("$1"); shift ;;
+        --count)         Q_COUNT="$2"; shift 2 ;;
+        --count=*)       Q_COUNT="${1#*=}"; shift ;;
+        --continue|-c)   CONTINUE_MODE=1; shift ;;
+        -*)              echo "Unknown flag: $1"; exit 1 ;;
+        *)               SELECT_ARGS+=("$1"); shift ;;
     esac
 done
 
@@ -93,6 +95,57 @@ if [ "${#SELECT_ARGS[@]}" -gt 0 ]; then
     fi
 else
     MODELS=("${ALL_MODELS[@]}")
+fi
+
+# ── Continue mode: skip models already finished in the latest report ──
+# A model is "done" when print_model_summary has written its block,
+# which happens for both completed and oom@<bench> outcomes.
+# The new report appends fresh results after the skipped ones.
+if [ "$CONTINUE_MODE" -eq 1 ]; then
+    # Find the most recent prior report (exclude the one we're about to write)
+    RESUME_REPORT=$(ls -t stress_oom_*.txt 2>/dev/null \
+        | grep -vx "$(basename "$REPORT_FILE")" | head -1 || true)
+
+    if [ -z "$RESUME_REPORT" ]; then
+        echo "ERROR: --continue requested but no previous stress_oom_*.txt found."
+        echo "       Run without --continue first, then retry."
+        exit 1
+    fi
+
+    echo "Continue mode — reading prior report: ${RESUME_REPORT}"
+
+    # Extract model names whose summary block was written (completed or OOM'd)
+    mapfile -t _DONE_MODELS < <(
+        grep -oP '(?<=MODEL SUMMARY — ).*' "$RESUME_REPORT" 2>/dev/null \
+        | awk '!seen[$0]++' || true
+    )
+
+    if [ "${#_DONE_MODELS[@]}" -gt 0 ]; then
+        echo "  Already finished (${#_DONE_MODELS[@]}): ${_DONE_MODELS[*]}"
+        FILTERED_MODELS=()
+        for entry in "${MODELS[@]}"; do
+            cfg=$(echo "$entry" | cut -d'|' -f3)
+            _skip=0
+            for done_cfg in "${_DONE_MODELS[@]}"; do
+                [ "$cfg" = "$done_cfg" ] && _skip=1 && break
+            done
+            [ "$_skip" -eq 0 ] && FILTERED_MODELS+=("$entry")
+        done
+        MODELS=("${FILTERED_MODELS[@]}")
+    fi
+
+    if [ "${#MODELS[@]}" -eq 0 ]; then
+        echo "Continue mode: nothing left to run — all models already finished."
+        exit 0
+    fi
+
+    echo "  Remaining (${#MODELS[@]}): $(for e in "${MODELS[@]}"; do echo -n "$(echo "$e"|cut -d'|' -f3) "; done)"
+    echo ""
+
+    # Carry the prior report into the new one so the final table covers all models
+    echo "# ── continued from ${RESUME_REPORT} ──" >> "$REPORT_FILE"
+    cat "$RESUME_REPORT" >> "$REPORT_FILE"
+    echo "" >> "$REPORT_FILE"
 fi
 
 # ── Question cache ────────────────────────────────────────────────────
@@ -381,4 +434,27 @@ done
 #  Final report
 # ═════════════════════════════════════════════════════════════════════
 BENCH_END=$(date +%s)
+
+# In continue mode, re-read previously finished models from the prior
+# report so the final table covers the full run, not just this session.
+if [ "$CONTINUE_MODE" -eq 1 ] && [ -n "${RESUME_REPORT:-}" ]; then
+    while IFS= read -r prev_model; do
+        [ -z "$prev_model" ] && continue
+        # Only add if not already in ALL_TESTED_MODELS (this session)
+        _already=0
+        for _m in "${ALL_TESTED_MODELS[@]}"; do
+            [ "$_m" = "$prev_model" ] && _already=1 && break
+        done
+        if [ "$_already" -eq 0 ]; then
+            ALL_TESTED_MODELS=("$prev_model" "${ALL_TESTED_MODELS[@]}")
+            # Mark with a note — detailed stats stay in the prior report section
+            R_STATUS["$prev_model"]="${R_STATUS[$prev_model]:-resumed}"
+            R_OOM_BENCH["$prev_model"]="${R_OOM_BENCH[$prev_model]:-see-prior}"
+            R_SECTIONS_DONE["$prev_model"]="${R_SECTIONS_DONE[$prev_model]:-?}"
+            R_TIME["$prev_model"]="${R_TIME[$prev_model]:-0}"
+        fi
+    done < <(grep -oP '(?<=MODEL SUMMARY — ).*' "$RESUME_REPORT" 2>/dev/null \
+             | awk '!seen[$0]++' || true)
+fi
+
 print_final_table $(( BENCH_END - BENCH_START ))
