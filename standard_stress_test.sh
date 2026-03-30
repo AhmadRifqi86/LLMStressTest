@@ -74,8 +74,14 @@ SERVER_READY_TIMEOUT=120
 
 # ── OOM-resistance: proactive server restart every N questions ─────────
 # Set to 0 to disable proactive restarts (reactive restart on ERROR still active).
-# 20 is a safe default for 2–4 GB Pi; increase to 25–30 if RAM is plentiful.
-BATCH_RESTART=20
+# 10 is a safe default for a 2 GB Pi; increase if your Pi has more RAM.
+BATCH_RESTART=10
+
+# ── RAM threshold: restart early if used RAM exceeds this before a question ──
+# Based on: llama3.2-1b at idle after load ≈ 1460 MB on Pi 4 2GB.
+# Trigger a restart before the question if used RAM is already this high.
+# Set to 0 to disable threshold-based restarts.
+RAM_RESTART_THRESHOLD_MB=1450
 
 # ── Report files ──────────────────────────────────────────────────────
 TS=$(date +%Y%m%d_%H%M%S)
@@ -761,17 +767,45 @@ fmt_time() { printf "%dm%02ds" $(( $1 / 60 )) $(( $1 % 60 )); }
 # ── Restart llama-server in-place (mid-section OOM recovery) ──────────
 # Uses globals: MODEL_FILE, REMOTE_DIR, SERVER_PORT, CTX_SIZE, THREADS, N_PREDICT_MATH
 # Returns 0 on success, 1 if server fails to come back.
+#
+# Recovery sequence:
+#   1. SIGTERM → SIGKILL llama-server
+#   2. Flush OS page cache (sync + drop_caches) — reclaims 100–200 MB on Pi
+#   3. Poll until used RAM drops below RAM_RESTART_THRESHOLD_MB (or 30s timeout)
+#   4. Relaunch and wait for /health
 restart_server_for_batch() {
-    local reason="$1"   # "proactive" | "reactive"
-    log "    [OOM-guard/${reason}] Stopping server to free RAM..."
+    local reason="$1"   # "proactive" | "reactive" | "ram-pressure"
+    local ram_before; ram_before=$(measure_ram_mb)
+    log "    [OOM-guard/${reason}] Stopping server  (RAM was ${ram_before} MB)..."
+
     ssh "$SSH_TARGET" "
         pkill -SIGTERM -f llama-server 2>/dev/null || true
         sleep 3
         pkill -SIGKILL -f llama-server 2>/dev/null || true
         sleep 2
+        # Flush OS page/dentry/inode caches to reclaim model weight pages
+        sync 2>/dev/null || true
+        sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || \
+            sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || true
+        sleep 1
     " 2>/dev/null || true
 
-    log "    [OOM-guard/${reason}] Relaunching llama-server with same model..."
+    # Poll until RAM drops to a safe level (max 30 s)
+    local poll=0
+    local safe_ram=$(( ${RAM_RESTART_THRESHOLD_MB:-1450} - 50 ))
+    while [ "$poll" -lt 30 ]; do
+        local cur_ram; cur_ram=$(measure_ram_mb)
+        if [ "${cur_ram:-9999}" -le "$safe_ram" ]; then
+            log "    [OOM-guard/${reason}] RAM freed: ${ram_before} → ${cur_ram} MB — relaunching"
+            break
+        fi
+        sleep 2; poll=$(( poll + 2 ))
+    done
+    if [ "$poll" -ge 30 ]; then
+        local cur_ram; cur_ram=$(measure_ram_mb)
+        log "    [OOM-guard/${reason}] RAM poll timeout (still ${cur_ram} MB) — launching anyway"
+    fi
+
     ssh "$SSH_TARGET" "bash -c '
         cd ${REMOTE_DIR} || exit 1
         nohup ./llama-server \
@@ -790,7 +824,8 @@ restart_server_for_batch() {
         log "    [OOM-guard/${reason}] !! Server failed to restart — marking section as failed"
         return 1
     fi
-    log "    [OOM-guard/${reason}] Server ready — resuming benchmark"
+    local ram_after; ram_after=$(measure_ram_mb)
+    log "    [OOM-guard/${reason}] Server ready  (RAM now ${ram_after} MB) — resuming"
     return 0
 }
 
@@ -968,6 +1003,20 @@ run_mc_section() {
         local cpu_pre; cpu_pre=$(echo "$snap_pre" | awk '{print $1}')
         local ram_pre; ram_pre=$(echo "$snap_pre" | awk '{print $2}')
 
+        # ── RAM-threshold restart: preempt OOM before the API call ────────
+        if [ "${RAM_RESTART_THRESHOLD_MB:-0}" -gt 0 ] && \
+           [ "${ram_pre:-0}" -ge "${RAM_RESTART_THRESHOLD_MB}" ]; then
+            log "    [OOM-guard/ram-pressure] RAM=${ram_pre}MB ≥ threshold ${RAM_RESTART_THRESHOLD_MB}MB at Q${qnum} — preemptive restart"
+            section_restarts=$(( section_restarts + 1 ))
+            if ! restart_server_for_batch "ram-pressure"; then
+                section_aborted=1; break
+            fi
+            # Refresh snapshot after restart
+            snap_pre=$(snapshot_resources)
+            cpu_pre=$(echo "$snap_pre" | awk '{print $1}')
+            ram_pre=$(echo "$snap_pre" | awk '{print $2}')
+        fi
+
         call_api "$sys_prompt" "$(printf '%b' "${_qs[$i]}")" "$N_PREDICT_MC"
 
         # ── Reactive restart: server died mid-section ─────────────────────
@@ -1037,6 +1086,19 @@ run_gsm8k_section() {
         local snap_pre; snap_pre=$(snapshot_resources)
         local cpu_pre; cpu_pre=$(echo "$snap_pre" | awk '{print $1}')
         local ram_pre; ram_pre=$(echo "$snap_pre" | awk '{print $2}')
+
+        # ── RAM-threshold restart: preempt OOM before the API call ────────
+        if [ "${RAM_RESTART_THRESHOLD_MB:-0}" -gt 0 ] && \
+           [ "${ram_pre:-0}" -ge "${RAM_RESTART_THRESHOLD_MB}" ]; then
+            log "    [OOM-guard/ram-pressure] RAM=${ram_pre}MB ≥ threshold ${RAM_RESTART_THRESHOLD_MB}MB at GSM_Q${qnum} — preemptive restart"
+            section_restarts=$(( section_restarts + 1 ))
+            if ! restart_server_for_batch "ram-pressure"; then
+                section_aborted=1; break
+            fi
+            snap_pre=$(snapshot_resources)
+            cpu_pre=$(echo "$snap_pre" | awk '{print $1}')
+            ram_pre=$(echo "$snap_pre" | awk '{print $2}')
+        fi
 
         call_api "$GSM8K_SYSTEM" "${_qs[$i]}" "$N_PREDICT_MATH"
 
