@@ -72,6 +72,11 @@ N_PREDICT_MATH=512     # GSM8K CoT needs room for step-by-step reasoning
 N_PREDICT_LC=64        # Long-context needle: short answer expected
 SERVER_READY_TIMEOUT=120
 
+# ── OOM-resistance: proactive server restart every N questions ─────────
+# Set to 0 to disable proactive restarts (reactive restart on ERROR still active).
+# 20 is a safe default for 2–4 GB Pi; increase to 25–30 if RAM is plentiful.
+BATCH_RESTART=20
+
 # ── Report files ──────────────────────────────────────────────────────
 TS=$(date +%Y%m%d_%H%M%S)
 REPORT_FILE="standard_stress_${TS}.txt"
@@ -753,6 +758,42 @@ stop_server() {
 
 fmt_time() { printf "%dm%02ds" $(( $1 / 60 )) $(( $1 % 60 )); }
 
+# ── Restart llama-server in-place (mid-section OOM recovery) ──────────
+# Uses globals: MODEL_FILE, REMOTE_DIR, SERVER_PORT, CTX_SIZE, THREADS, N_PREDICT_MATH
+# Returns 0 on success, 1 if server fails to come back.
+restart_server_for_batch() {
+    local reason="$1"   # "proactive" | "reactive"
+    log "    [OOM-guard/${reason}] Stopping server to free RAM..."
+    ssh "$SSH_TARGET" "
+        pkill -SIGTERM -f llama-server 2>/dev/null || true
+        sleep 3
+        pkill -SIGKILL -f llama-server 2>/dev/null || true
+        sleep 2
+    " 2>/dev/null || true
+
+    log "    [OOM-guard/${reason}] Relaunching llama-server with same model..."
+    ssh "$SSH_TARGET" "bash -c '
+        cd ${REMOTE_DIR} || exit 1
+        nohup ./llama-server \
+            -m model/${MODEL_FILE} \
+            --host 0.0.0.0 \
+            --port ${SERVER_PORT} \
+            --ctx-size ${CTX_SIZE} \
+            --threads ${THREADS} \
+            -n ${N_PREDICT_MATH} \
+            >> llama-server.log 2>&1 &
+        disown \$! 2>/dev/null || true
+        echo started
+    '" 2>/dev/null || true
+
+    if ! wait_for_server; then
+        log "    [OOM-guard/${reason}] !! Server failed to restart — marking section as failed"
+        return 1
+    fi
+    log "    [OOM-guard/${reason}] Server ready — resuming benchmark"
+    return 0
+}
+
 # ── KV cache size — parse llama-server.log after startup ─────────────
 # llama.cpp logs: "llm_load_tensors: kv self size  =  NNN.NN MiB"
 # Returns the numeric MiB value, or "N/A" on failure.
@@ -904,6 +945,8 @@ run_mc_section() {
 
     SECTION_CORRECT=0; SECTION_TOTAL=0
     local sec_start; sec_start=$(date +%s)
+    local section_restarts=0
+    local section_aborted=0
     CURRENT_SECTION="$section"
 
     for i in "${!_qs[@]}"; do
@@ -911,12 +954,32 @@ run_mc_section() {
         CURRENT_Q="Q${qnum}"
         track_step "api_call"
 
+        # ── Proactive restart: every BATCH_RESTART questions ─────────────
+        if [ "${BATCH_RESTART:-0}" -gt 0 ] && [ "$qnum" -gt 1 ] && \
+           [ $(( (qnum - 1) % BATCH_RESTART )) -eq 0 ]; then
+            if ! restart_server_for_batch "proactive"; then
+                section_aborted=1; break
+            fi
+            section_restarts=$(( section_restarts + 1 ))
+        fi
+
         local q_ts; q_ts=$(date '+%Y-%m-%d %H:%M:%S')
         local snap_pre; snap_pre=$(snapshot_resources)
         local cpu_pre; cpu_pre=$(echo "$snap_pre" | awk '{print $1}')
         local ram_pre; ram_pre=$(echo "$snap_pre" | awk '{print $2}')
 
         call_api "$sys_prompt" "$(printf '%b' "${_qs[$i]}")" "$N_PREDICT_MC"
+
+        # ── Reactive restart: server died mid-section ─────────────────────
+        if [ "$LAST_RESPONSE" = "ERROR" ] && ! check_alive; then
+            log "    [OOM-guard/reactive] Server unresponsive at Q${qnum} — attempting restart..."
+            section_restarts=$(( section_restarts + 1 ))
+            if ! restart_server_for_batch "reactive"; then
+                section_aborted=1; break
+            fi
+            # Retry the question once after recovery
+            call_api "$sys_prompt" "$(printf '%b' "${_qs[$i]}")" "$N_PREDICT_MC"
+        fi
 
         local snap_post; snap_post=$(snapshot_resources)
         local cpu_post; cpu_post=$(echo "$snap_post" | awk '{print $1}')
@@ -935,8 +998,13 @@ run_mc_section() {
 
     local sec_end; sec_end=$(date +%s)
     SECTION_TIME_S=$(( sec_end - sec_start ))
-    local pct=$(python3 -c "print(f'{$SECTION_CORRECT / $SECTION_TOTAL * 100:.0f}')")
-    log "  → ${section}: ${SECTION_CORRECT}/${SECTION_TOTAL} = ${pct}%  ($(fmt_time $SECTION_TIME_S))"
+    local pct="N/A"
+    [ "$SECTION_TOTAL" -gt 0 ] && pct=$(python3 -c "print(f'{$SECTION_CORRECT / $SECTION_TOTAL * 100:.0f}')")
+    local restart_note=""
+    [ "$section_restarts" -gt 0 ] && restart_note="  [${section_restarts} server restart(s)]"
+    [ "$section_aborted" -eq 1 ] && restart_note="${restart_note}  [ABORTED after restart failure]"
+    log "  → ${section}: ${SECTION_CORRECT}/${SECTION_TOTAL} = ${pct}%  ($(fmt_time $SECTION_TIME_S))${restart_note}"
+    return "$section_aborted"
 }
 
 # ── Run GSM8K section ─────────────────────────────────────────────────
@@ -946,6 +1014,8 @@ run_gsm8k_section() {
 
     SECTION_CORRECT=0; SECTION_TOTAL=0
     local sec_start; sec_start=$(date +%s)
+    local section_restarts=0
+    local section_aborted=0
     CURRENT_SECTION="GSM8K"
 
     for i in "${!_qs[@]}"; do
@@ -953,12 +1023,32 @@ run_gsm8k_section() {
         CURRENT_Q="GSM_Q${qnum}"
         track_step "api_call"
 
+        # ── Proactive restart every BATCH_RESTART questions ───────────────
+        # GSM8K generates up to 512 tokens per question — highest RAM pressure of all sections.
+        if [ "${BATCH_RESTART:-0}" -gt 0 ] && [ "$qnum" -gt 1 ] && \
+           [ $(( (qnum - 1) % BATCH_RESTART )) -eq 0 ]; then
+            if ! restart_server_for_batch "proactive"; then
+                section_aborted=1; break
+            fi
+            section_restarts=$(( section_restarts + 1 ))
+        fi
+
         local q_ts; q_ts=$(date '+%Y-%m-%d %H:%M:%S')
         local snap_pre; snap_pre=$(snapshot_resources)
         local cpu_pre; cpu_pre=$(echo "$snap_pre" | awk '{print $1}')
         local ram_pre; ram_pre=$(echo "$snap_pre" | awk '{print $2}')
 
         call_api "$GSM8K_SYSTEM" "${_qs[$i]}" "$N_PREDICT_MATH"
+
+        # ── Reactive restart: server died mid-section ─────────────────────
+        if [ "$LAST_RESPONSE" = "ERROR" ] && ! check_alive; then
+            log "    [OOM-guard/reactive] Server unresponsive at GSM_Q${qnum} — attempting restart..."
+            section_restarts=$(( section_restarts + 1 ))
+            if ! restart_server_for_batch "reactive"; then
+                section_aborted=1; break
+            fi
+            call_api "$GSM8K_SYSTEM" "${_qs[$i]}" "$N_PREDICT_MATH"
+        fi
 
         local snap_post; snap_post=$(snapshot_resources)
         local cpu_post; cpu_post=$(echo "$snap_post" | awk '{print $1}')
@@ -977,8 +1067,13 @@ run_gsm8k_section() {
 
     local sec_end; sec_end=$(date +%s)
     SECTION_TIME_S=$(( sec_end - sec_start ))
-    local pct=$(python3 -c "print(f'{$SECTION_CORRECT / $SECTION_TOTAL * 100:.0f}')")
-    log "  → GSM8K: ${SECTION_CORRECT}/${SECTION_TOTAL} = ${pct}%  ($(fmt_time $SECTION_TIME_S))"
+    local pct="N/A"
+    [ "$SECTION_TOTAL" -gt 0 ] && pct=$(python3 -c "print(f'{$SECTION_CORRECT / $SECTION_TOTAL * 100:.0f}')")
+    local restart_note=""
+    [ "$section_restarts" -gt 0 ] && restart_note="  [${section_restarts} server restart(s)]"
+    [ "$section_aborted" -eq 1 ] && restart_note="${restart_note}  [ABORTED after restart failure]"
+    log "  → GSM8K: ${SECTION_CORRECT}/${SECTION_TOTAL} = ${pct}%  ($(fmt_time $SECTION_TIME_S))${restart_note}"
+    return "$section_aborted"
 }
 
 # ── Run Section 7: Long Context / Needle-in-a-Haystack ───────────────
@@ -1006,6 +1101,14 @@ run_long_context_section() {
         local ram_before; ram_before=$(echo "$snap_pre" | awk '{print $2}')
 
         call_api "$LC_SYSTEM" "${lc_prompts[$i]}" "$N_PREDICT_LC"
+
+        # ── Reactive restart: server died on large context prompt ─────────
+        if [ "$LAST_RESPONSE" = "ERROR" ] && ! check_alive; then
+            log "    [OOM-guard/reactive] Server unresponsive at ${label} — attempting restart..."
+            if restart_server_for_batch "reactive"; then
+                call_api "$LC_SYSTEM" "${lc_prompts[$i]}" "$N_PREDICT_LC"
+            fi
+        fi
 
         local snap_post; snap_post=$(snapshot_resources)
         local cpu_post; cpu_post=$(echo "$snap_post" | awk '{print $1}')
@@ -1181,7 +1284,8 @@ for model_entry in "${MODELS[@]}"; do
     mark_section "ARC-Easy"
     run_mc_section "ARC-Easy" "$MC_SYSTEM_0SHOT" ARC_E_Q ARC_E_ANS
     arc_e_c=$SECTION_CORRECT; arc_e_t=$SECTION_TOTAL; arc_e_s=$SECTION_TIME_S
-    arc_e_pct=$(python3 -c "print(f'{$arc_e_c/$arc_e_t*100:.0f}')")
+    arc_e_pct="N/A"
+    [ "$arc_e_t" -gt 0 ] && arc_e_pct=$(python3 -c "print(f'{$arc_e_c/$arc_e_t*100:.0f}')")
     R_ARC_E["$PICOCLAW_CFG"]="$arc_e_pct"
 
     if ! assert_alive; then
@@ -1200,7 +1304,8 @@ for model_entry in "${MODELS[@]}"; do
     mark_section "ARC-Challenge"
     run_mc_section "ARC-Challenge" "$MC_SYSTEM_0SHOT" ARC_C_Q ARC_C_ANS
     arc_c_c=$SECTION_CORRECT; arc_c_t=$SECTION_TOTAL; arc_c_s=$SECTION_TIME_S
-    arc_c_pct=$(python3 -c "print(f'{$arc_c_c/$arc_c_t*100:.0f}')")
+    arc_c_pct="N/A"
+    [ "$arc_c_t" -gt 0 ] && arc_c_pct=$(python3 -c "print(f'{$arc_c_c/$arc_c_t*100:.0f}')")
     R_ARC_C["$PICOCLAW_CFG"]="$arc_c_pct"
 
     if ! assert_alive; then
@@ -1219,7 +1324,8 @@ for model_entry in "${MODELS[@]}"; do
     mark_section "HellaSwag"
     run_mc_section "HellaSwag" "$MC_SYSTEM_0SHOT" HS_Q HS_ANS
     hs_c=$SECTION_CORRECT; hs_t=$SECTION_TOTAL; hs_s=$SECTION_TIME_S
-    hs_pct=$(python3 -c "print(f'{$hs_c/$hs_t*100:.0f}')")
+    hs_pct="N/A"
+    [ "$hs_t" -gt 0 ] && hs_pct=$(python3 -c "print(f'{$hs_c/$hs_t*100:.0f}')")
     R_HELLASWAG["$PICOCLAW_CFG"]="$hs_pct"
 
     if ! assert_alive; then
@@ -1238,7 +1344,8 @@ for model_entry in "${MODELS[@]}"; do
     mark_section "MMLU"
     run_mc_section "MMLU" "$MMLU_SYSTEM" MMLU_Q MMLU_ANS
     mmlu_c=$SECTION_CORRECT; mmlu_t=$SECTION_TOTAL; mmlu_s=$SECTION_TIME_S
-    mmlu_pct=$(python3 -c "print(f'{$mmlu_c/$mmlu_t*100:.0f}')")
+    mmlu_pct="N/A"
+    [ "$mmlu_t" -gt 0 ] && mmlu_pct=$(python3 -c "print(f'{$mmlu_c/$mmlu_t*100:.0f}')")
     R_MMLU["$PICOCLAW_CFG"]="$mmlu_pct"
 
     if ! assert_alive; then
@@ -1257,7 +1364,8 @@ for model_entry in "${MODELS[@]}"; do
     mark_section "GSM8K"
     run_gsm8k_section GSM8K_Q GSM8K_ANS
     gsm_c=$SECTION_CORRECT; gsm_t=$SECTION_TOTAL; gsm_s=$SECTION_TIME_S
-    gsm_pct=$(python3 -c "print(f'{$gsm_c/$gsm_t*100:.0f}')")
+    gsm_pct="N/A"
+    [ "$gsm_t" -gt 0 ] && gsm_pct=$(python3 -c "print(f'{$gsm_c/$gsm_t*100:.0f}')")
     R_GSM8K["$PICOCLAW_CFG"]="$gsm_pct"
 
     if ! assert_alive; then
@@ -1276,7 +1384,8 @@ for model_entry in "${MODELS[@]}"; do
     mark_section "TruthfulQA"
     run_mc_section "TruthfulQA" "$MC_SYSTEM_0SHOT" TQA_Q TQA_ANS
     tqa_c=$SECTION_CORRECT; tqa_t=$SECTION_TOTAL; tqa_s=$SECTION_TIME_S
-    tqa_pct=$(python3 -c "print(f'{$tqa_c/$tqa_t*100:.0f}')")
+    tqa_pct="N/A"
+    [ "$tqa_t" -gt 0 ] && tqa_pct=$(python3 -c "print(f'{$tqa_c/$tqa_t*100:.0f}')")
     R_TQA["$PICOCLAW_CFG"]="$tqa_pct"
 
     if ! assert_alive; then
@@ -1307,10 +1416,16 @@ for model_entry in "${MODELS[@]}"; do
         clean_edge; continue
     fi
 
-    # ── Composite score (mean accuracy across all 7 sections) ──────────
+    # ── Composite score — average only over sections that completed ───────
+    # Sections aborted by unrecoverable OOM report N/A; those are excluded from mean.
     composite=$(python3 -c "
-vals=[${arc_e_pct},${arc_c_pct},${hs_pct},${mmlu_pct},${gsm_pct},${tqa_pct},${lc_pct}]
-print(f'{sum(vals)/len(vals):.1f}')
+raw = [('ARC-E','${arc_e_pct}'),('ARC-C','${arc_c_pct}'),('HellaSwag','${hs_pct}'),
+       ('MMLU','${mmlu_pct}'),('GSM8K','${gsm_pct}'),('TruthfulQA','${tqa_pct}'),('LongCtx','${lc_pct}')]
+vals = [(n, float(v)) for n, v in raw if v not in ('N/A', '')]
+if vals:
+    print(f'{sum(v for _,v in vals)/len(vals):.1f}')
+else:
+    print('N/A')
 ")
     R_COMPOSITE["$PICOCLAW_CFG"]="$composite"
     R_STATUS["$PICOCLAW_CFG"]="done"
