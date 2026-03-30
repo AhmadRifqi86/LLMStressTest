@@ -736,6 +736,16 @@ measure_ram_mb() {
         "free -m | awk '/^Mem:/{print \$3}'" 2>/dev/null || echo "0"
 }
 
+# ── Single-call CPU% + RAM snapshot — returns "cpu_pct ram_mb" ────────
+# Combines ps %cpu for llama-server and free -m into one SSH round-trip.
+snapshot_resources() {
+    ssh -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no \
+        "$SSH_TARGET" \
+        "cpu=\$(ps -C llama-server -o %cpu= 2>/dev/null | awk '{s+=\$1}END{printf \"%.1f\",s+0}'); \
+         ram=\$(free -m | awk '/^Mem:/{print \$3}'); \
+         echo \"\${cpu:-0} \${ram:-0}\"" 2>/dev/null || echo "0 0"
+}
+
 # ── API call wrapper ──────────────────────────────────────────────────
 # Sets LAST_RESPONSE, LAST_LATENCY_MS, LAST_PROMPT_TOKENS, LAST_COMPLETION_TOKENS
 LAST_RESPONSE=""
@@ -866,7 +876,16 @@ run_mc_section() {
         CURRENT_Q="Q${qnum}"
         track_step "api_call"
 
+        local q_ts; q_ts=$(date '+%Y-%m-%d %H:%M:%S')
+        local snap_pre; snap_pre=$(snapshot_resources)
+        local cpu_pre; cpu_pre=$(echo "$snap_pre" | awk '{print $1}')
+        local ram_pre; ram_pre=$(echo "$snap_pre" | awk '{print $2}')
+
         call_api "$sys_prompt" "$(printf '%b' "${_qs[$i]}")" "$N_PREDICT_MC"
+
+        local snap_post; snap_post=$(snapshot_resources)
+        local cpu_post; cpu_post=$(echo "$snap_post" | awk '{print $1}')
+        local ram_post; ram_post=$(echo "$snap_post" | awk '{print $2}')
 
         local predicted; predicted=$(parse_mc "$LAST_RESPONSE")
         local correct="${_ans[$i]}"
@@ -875,7 +894,7 @@ run_mc_section() {
         SECTION_TOTAL=$((SECTION_TOTAL + 1))
 
         local marker; marker=$([ "$ok" -eq 1 ] && echo "✓" || echo "✗")
-        log "    Q${qnum}: predicted=${predicted} correct=${correct} ${marker}  (${LAST_LATENCY_MS}ms)"
+        log "    Q${qnum} [${q_ts}]: predicted=${predicted} correct=${correct} ${marker}  latency=${LAST_LATENCY_MS}ms  cpu=${cpu_pre}→${cpu_post}%  ram=${ram_pre}→${ram_post}MB"
         log "         Response: $(echo "$LAST_RESPONSE" | head -1 | cut -c1-100)"
     done
 
@@ -899,7 +918,16 @@ run_gsm8k_section() {
         CURRENT_Q="GSM_Q${qnum}"
         track_step "api_call"
 
+        local q_ts; q_ts=$(date '+%Y-%m-%d %H:%M:%S')
+        local snap_pre; snap_pre=$(snapshot_resources)
+        local cpu_pre; cpu_pre=$(echo "$snap_pre" | awk '{print $1}')
+        local ram_pre; ram_pre=$(echo "$snap_pre" | awk '{print $2}')
+
         call_api "$GSM8K_SYSTEM" "${_qs[$i]}" "$N_PREDICT_MATH"
+
+        local snap_post; snap_post=$(snapshot_resources)
+        local cpu_post; cpu_post=$(echo "$snap_post" | awk '{print $1}')
+        local ram_post; ram_post=$(echo "$snap_post" | awk '{print $2}')
 
         local predicted; predicted=$(parse_number "$LAST_RESPONSE")
         local correct="${_ans[$i]}"
@@ -908,7 +936,7 @@ run_gsm8k_section() {
         SECTION_TOTAL=$((SECTION_TOTAL + 1))
 
         local marker; marker=$([ "$ok" -eq 1 ] && echo "✓" || echo "✗")
-        log "    Q${qnum}: predicted=${predicted} correct=${correct} ${marker}  (${LAST_LATENCY_MS}ms)"
+        log "    Q${qnum} [${q_ts}]: predicted=${predicted} correct=${correct} ${marker}  latency=${LAST_LATENCY_MS}ms  cpu=${cpu_pre}→${cpu_post}%  ram=${ram_pre}→${ram_post}MB"
         log "         Response: $(echo "$LAST_RESPONSE" | tail -3 | tr '\n' ' ' | cut -c1-120)"
     done
 
@@ -937,9 +965,16 @@ run_long_context_section() {
         CURRENT_Q="$label"
         track_step "api_call"
 
-        local ram_before; ram_before=$(measure_ram_mb)
+        local q_ts; q_ts=$(date '+%Y-%m-%d %H:%M:%S')
+        local snap_pre; snap_pre=$(snapshot_resources)
+        local cpu_pre; cpu_pre=$(echo "$snap_pre" | awk '{print $1}')
+        local ram_before; ram_before=$(echo "$snap_pre" | awk '{print $2}')
+
         call_api "$LC_SYSTEM" "${lc_prompts[$i]}" "$N_PREDICT_LC"
-        local ram_after; ram_after=$(measure_ram_mb)
+
+        local snap_post; snap_post=$(snapshot_resources)
+        local cpu_post; cpu_post=$(echo "$snap_post" | awk '{print $1}')
+        local ram_after; ram_after=$(echo "$snap_post" | awk '{print $2}')
         local ram_delta=$(( ram_after - ram_before ))
 
         local found=0
@@ -952,7 +987,7 @@ run_long_context_section() {
             ctx_fill=$(python3 -c "print(f'{${LAST_PROMPT_TOKENS}/${CTX_SIZE}*100:.0f}')")
         fi
         local detail_line
-        detail_line="    ${label}: needle=${marker}  ${LAST_LATENCY_MS}ms  ctx_fill=${ctx_fill}%  RAM_delta=${ram_delta}MB  prompt_tok=${LAST_PROMPT_TOKENS:-?}  compl_tok=${LAST_COMPLETION_TOKENS:-?}"
+        detail_line="    ${label} [${q_ts}]: needle=${marker}  latency=${LAST_LATENCY_MS}ms  ctx_fill=${ctx_fill}%  cpu=${cpu_pre}→${cpu_post}%  ram=${ram_before}→${ram_after}MB (delta=${ram_delta}MB)  prompt_tok=${LAST_PROMPT_TOKENS:-?}  compl_tok=${LAST_COMPLETION_TOKENS:-?}"
         log "$detail_line"
         log "         Response: $(echo "$LAST_RESPONSE" | head -1 | cut -c1-100)"
         LC_DETAIL="${LC_DETAIL}${detail_line}"$'\n'
@@ -1107,7 +1142,7 @@ for model_entry in "${MODELS[@]}"; do
     #  [1] ARC-Easy  —  0-shot, normalized accuracy  [Clark et al. 2018]
     # ════════════════════════════════════════════════════════════════════
     sep
-    log "  [1/6] ARC-Easy  (0-shot, 5 questions)  [Clark et al. 2018]"
+    log "  [1/7] ARC-Easy  (0-shot, 100 questions)  [Clark et al. 2018]"
     mark_section "ARC-Easy"
     run_mc_section "ARC-Easy" "$MC_SYSTEM_0SHOT" ARC_E_Q ARC_E_ANS
     arc_e_c=$SECTION_CORRECT; arc_e_t=$SECTION_TOTAL; arc_e_s=$SECTION_TIME_S
@@ -1126,7 +1161,7 @@ for model_entry in "${MODELS[@]}"; do
     #  [2] ARC-Challenge  —  0-shot  [Clark et al. 2018]
     # ════════════════════════════════════════════════════════════════════
     sep
-    log "  [2/6] ARC-Challenge  (0-shot, 5 questions)  [Clark et al. 2018]"
+    log "  [2/7] ARC-Challenge  (0-shot, 100 questions)  [Clark et al. 2018]"
     mark_section "ARC-Challenge"
     run_mc_section "ARC-Challenge" "$MC_SYSTEM_0SHOT" ARC_C_Q ARC_C_ANS
     arc_c_c=$SECTION_CORRECT; arc_c_t=$SECTION_TOTAL; arc_c_s=$SECTION_TIME_S
@@ -1145,7 +1180,7 @@ for model_entry in "${MODELS[@]}"; do
     #  [3] HellaSwag  —  0-shot  [Zellers et al. 2019]
     # ════════════════════════════════════════════════════════════════════
     sep
-    log "  [3/6] HellaSwag  (0-shot, 5 questions)  [Zellers et al. 2019]"
+    log "  [3/7] HellaSwag  (0-shot, 100 questions)  [Zellers et al. 2019]"
     mark_section "HellaSwag"
     run_mc_section "HellaSwag" "$MC_SYSTEM_0SHOT" HS_Q HS_ANS
     hs_c=$SECTION_CORRECT; hs_t=$SECTION_TOTAL; hs_s=$SECTION_TIME_S
@@ -1164,7 +1199,7 @@ for model_entry in "${MODELS[@]}"; do
     #  [4] MMLU  —  5-shot  [Hendrycks et al. 2020]
     # ════════════════════════════════════════════════════════════════════
     sep
-    log "  [4/6] MMLU  (5-shot, 5 questions across domains)  [Hendrycks et al. 2020]"
+    log "  [4/7] MMLU  (5-shot, 100 questions across domains)  [Hendrycks et al. 2020]"
     mark_section "MMLU"
     run_mc_section "MMLU" "$MMLU_SYSTEM" MMLU_Q MMLU_ANS
     mmlu_c=$SECTION_CORRECT; mmlu_t=$SECTION_TOTAL; mmlu_s=$SECTION_TIME_S
@@ -1183,7 +1218,7 @@ for model_entry in "${MODELS[@]}"; do
     #  [5] GSM8K  —  2-shot chain-of-thought  [Cobbe et al. 2021]
     # ════════════════════════════════════════════════════════════════════
     sep
-    log "  [5/6] GSM8K  (2-shot CoT, 4 problems)  [Cobbe et al. 2021]"
+    log "  [5/7] GSM8K  (2-shot CoT, 100 problems)  [Cobbe et al. 2021]"
     mark_section "GSM8K"
     run_gsm8k_section GSM8K_Q GSM8K_ANS
     gsm_c=$SECTION_CORRECT; gsm_t=$SECTION_TOTAL; gsm_s=$SECTION_TIME_S
@@ -1202,7 +1237,7 @@ for model_entry in "${MODELS[@]}"; do
     #  [6] TruthfulQA  —  0-shot MC1  [Lin et al. 2021]
     # ════════════════════════════════════════════════════════════════════
     sep
-    log "  [6/7] TruthfulQA  (0-shot MC1, 4 questions)  [Lin et al. 2021]"
+    log "  [6/7] TruthfulQA  (0-shot MC1, 100 questions)  [Lin et al. 2021]"
     mark_section "TruthfulQA"
     run_mc_section "TruthfulQA" "$MC_SYSTEM_0SHOT" TQA_Q TQA_ANS
     tqa_c=$SECTION_CORRECT; tqa_t=$SECTION_TOTAL; tqa_s=$SECTION_TIME_S
