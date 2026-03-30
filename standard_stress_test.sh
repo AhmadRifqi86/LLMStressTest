@@ -53,6 +53,9 @@
 #  USAGE:
 #    ./standard_stress_test.sh                   — auto top-3 from newest report
 #    ./standard_stress_test.sh llama3.2-1b       — specific model(s)
+#    ./standard_stress_test.sh continue          — resume unfinished from latest stress report
+#    ./standard_stress_test.sh continue gemma3-1b qwen3-1.7b
+#                                              — resume only unfinished from provided subset
 # ═══════════════════════════════════════════════════════════════════════
 set -e
 
@@ -136,16 +139,26 @@ BASELINES["qwen3.5-0.8b"]="63|40|58|46|32|44"
 # ─────────────────────────────────────────────────────────────────────
 #  Model selection — top 3 from newest benchmark report, or manual
 # ─────────────────────────────────────────────────────────────────────
-if [ "$#" -gt 0 ]; then
+CONTINUE_MODE=0
+SELECT_ARGS=()
+for arg in "$@"; do
+    if [ "$arg" = "continue" ] || [ "$arg" = "--continue" ]; then
+        CONTINUE_MODE=1
+    else
+        SELECT_ARGS+=("$arg")
+    fi
+done
+
+if [ "${#SELECT_ARGS[@]}" -gt 0 ]; then
     MODELS=()
     for entry in "${ALL_MODELS[@]}"; do
         cfg=$(echo "$entry" | cut -d'|' -f3)
-        for arg in "$@"; do
+        for arg in "${SELECT_ARGS[@]}"; do
             [ "$cfg" = "$arg" ] && MODELS+=("$entry")
         done
     done
     if [ "${#MODELS[@]}" -eq 0 ]; then
-        echo "ERROR: No match for: $*"
+        echo "ERROR: No match for: ${SELECT_ARGS[*]}"
         echo "Available: $(for e in "${ALL_MODELS[@]}"; do echo -n "$(echo "$e"|cut -d'|' -f3) "; done)"
         exit 1
     fi
@@ -202,6 +215,67 @@ PYEOF
     done <<< "$TOP3"
     [ "${#MODELS[@]}" -eq 0 ] && { echo "ERROR: Top-3 models not in ALL_MODELS."; exit 1; }
     log ""
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+#  Continue mode — skip models already completed in newest prior report
+# ─────────────────────────────────────────────────────────────────────
+if [ "$CONTINUE_MODE" -eq 1 ]; then
+    RESUME_REPORT=$(ls -t standard_stress_*.txt 2>/dev/null | grep -vx "$REPORT_FILE" | head -1 || true)
+    if [ -z "$RESUME_REPORT" ]; then
+        echo "ERROR: continue requested, but no previous standard_stress_*.txt found."
+        echo "Run once without continue, then retry."
+        exit 1
+    fi
+
+    log "Continue mode enabled — source report: ${RESUME_REPORT}"
+
+    if [ "${#SELECT_ARGS[@]}" -eq 0 ]; then
+        # When no models are provided, resume the exact set that was attempted in the last run.
+        mapfile -t RESUME_CFGS < <(
+            grep -oP '^\[[0-9]+/[0-9]+\]\s+\K[^ ]+' "$RESUME_REPORT" | awk '!seen[$0]++'
+        )
+
+        if [ "${#RESUME_CFGS[@]}" -eq 0 ]; then
+            echo "ERROR: Could not extract model list from ${RESUME_REPORT}."
+            echo "Provide model names explicitly with continue, e.g. ./standard_stress_test.sh continue llama3.2-1b"
+            exit 1
+        fi
+
+        MODELS=()
+        for cfg in "${RESUME_CFGS[@]}"; do
+            for entry in "${ALL_MODELS[@]}"; do
+                if [ "$(echo "$entry" | cut -d'|' -f3)" = "$cfg" ]; then
+                    MODELS+=("$entry")
+                    break
+                fi
+            done
+        done
+    fi
+
+    mapfile -t DONE_CFGS < <(
+        grep -oP 'RESULTS SUMMARY —\s*\K[^ ]+' "$RESUME_REPORT" | awk '!seen[$0]++'
+    )
+
+    if [ "${#DONE_CFGS[@]}" -gt 0 ]; then
+        FILTERED_MODELS=()
+        for entry in "${MODELS[@]}"; do
+            cfg=$(echo "$entry" | cut -d'|' -f3)
+            skip=0
+            for done_cfg in "${DONE_CFGS[@]}"; do
+                [ "$cfg" = "$done_cfg" ] && skip=1 && break
+            done
+            [ "$skip" -eq 0 ] && FILTERED_MODELS+=("$entry")
+        done
+        MODELS=("${FILTERED_MODELS[@]}")
+    fi
+
+    if [ "${#MODELS[@]}" -eq 0 ]; then
+        log "Continue mode: nothing to run. All selected models were already completed."
+        exit 0
+    fi
+
+    log "Continue mode: ${#MODELS[@]} unfinished model(s) queued."
 fi
 
 # ═══════════════════════════════════════════════════════════════════════
